@@ -1,0 +1,137 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Response;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
+
+class BackupController extends Controller
+{
+    public function index()
+    {
+        $dbName = config('database.connections.mysql.database');
+        
+        // Calculate DB size
+        $sizeQuery = DB::select('SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS "Size" 
+                                 FROM information_schema.TABLES 
+                                 WHERE table_schema = ?', [$dbName]);
+        $dbSize = count($sizeQuery) > 0 ? $sizeQuery[0]->Size . ' MB' : '0 MB';
+
+        // Get backup files
+        $directory = storage_path('app/public');
+        if (!File::exists($directory)) {
+            File::makeDirectory($directory, 0755, true);
+        }
+
+        $files = File::files($directory);
+        $backups = [];
+        
+        foreach ($files as $file) {
+            if ($file->getExtension() === 'sql' && str_starts_with($file->getFilename(), 'backup_')) {
+                $backups[] = [
+                    'name' => $file->getFilename(),
+                    'size' => round($file->getSize() / 1024 / 1024, 2) . ' MB',
+                    'date' => Carbon::createFromTimestamp($file->getMTime())->locale('id')->isoFormat('D MMMM Y HH:mm') . ' WIB',
+                    'timestamp' => $file->getMTime(),
+                    'creator' => 'Admin' // Hardcoded since we don't store creator in the file, or we can parse from name if we added it
+                ];
+            }
+        }
+
+        // Sort backups by timestamp descending
+        usort($backups, function ($a, $b) {
+            return $b['timestamp'] <=> $a['timestamp'];
+        });
+
+        $lastBackup = count($backups) > 0 ? $backups[0]['date'] : 'Belum pernah backup';
+
+        return view('admin.backup.index', compact('dbName', 'dbSize', 'lastBackup', 'backups'));
+    }
+
+    public function create()
+    {
+        $dbName = config('database.connections.mysql.database');
+        $dbUser = config('database.connections.mysql.username');
+        $dbPass = config('database.connections.mysql.password');
+        
+        $filename = 'backup_' . date('Y-m-d_His') . '.sql';
+        $path = storage_path('app/public/' . $filename);
+        
+        if (!File::exists(storage_path('app/public'))) {
+            File::makeDirectory(storage_path('app/public'), 0755, true);
+        }
+        
+        $mysqldumpPath = 'c:\xampp\mysql\bin\mysqldump.exe';
+        if (!file_exists($mysqldumpPath)) {
+            $mysqldumpPath = 'mysqldump'; // fallback
+        }
+        
+        $passwordArg = $dbPass ? "-p\"$dbPass\"" : "";
+        $command = "\"$mysqldumpPath\" -u $dbUser $passwordArg $dbName > \"$path\"";
+        
+        exec($command, $output, $returnVar);
+        
+        if ($returnVar !== 0) {
+            return back()->with('error', 'Gagal membuat backup database. Return code: ' . $returnVar);
+        }
+        
+        return back()->with('success', 'Backup database berhasil dibuat.');
+    }
+
+    public function downloadFile($filename)
+    {
+        $path = storage_path('app/public/' . $filename);
+        
+        if (!File::exists($path) || !str_starts_with($filename, 'backup_')) {
+            return back()->with('error', 'File backup tidak ditemukan.');
+        }
+        
+        return response()->download($path);
+    }
+    
+    public function destroy($filename)
+    {
+        $path = storage_path('app/public/' . $filename);
+        
+        if (File::exists($path) && str_starts_with($filename, 'backup_')) {
+            File::delete($path);
+            return back()->with('success', 'File backup berhasil dihapus.');
+        }
+        
+        return back()->with('error', 'File backup tidak ditemukan.');
+    }
+
+    public function restore(Request $request)
+    {
+        $request->validate([
+            'backup_file' => 'required|file|mimetypes:text/plain,application/sql|mimes:sql,txt',
+        ]);
+
+        $file = $request->file('backup_file');
+        
+        $dbName = config('database.connections.mysql.database');
+        $dbUser = config('database.connections.mysql.username');
+        $dbPass = config('database.connections.mysql.password');
+        
+        $mysqlPath = 'c:\xampp\mysql\bin\mysql.exe';
+        if (!file_exists($mysqlPath)) {
+            $mysqlPath = 'mysql'; // fallback
+        }
+        
+        $passwordArg = $dbPass ? "-p\"$dbPass\"" : "";
+        $filePath = $file->getRealPath();
+        
+        $command = "\"$mysqlPath\" -u $dbUser $passwordArg $dbName < \"$filePath\"";
+        
+        exec($command, $output, $returnVar);
+        
+        if ($returnVar !== 0) {
+            return back()->with('error', 'Gagal melakukan restore database. Return code: ' . $returnVar);
+        }
+        
+        return back()->with('success', 'Database berhasil di-restore!');
+    }
+}
